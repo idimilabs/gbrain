@@ -2,15 +2,15 @@
  * Embedding Service
  * Ported from production Ruby implementation (embedding_service.rb, 190 LOC)
  *
- * OpenAI text-embedding-3-large at 1536 dimensions.
+ * OpenAI-compatible embeddings at 1536 dimensions by default.
  * Retry with exponential backoff (4s base, 120s cap, 5 retries).
  * 8000 character input truncation.
  */
 
 import OpenAI from 'openai';
 
-const MODEL = 'text-embedding-3-large';
-const DIMENSIONS = 1536;
+const DEFAULT_MODEL = 'text-embedding-3-large';
+const DEFAULT_DIMENSIONS = 1536;
 const MAX_CHARS = 8000;
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 4000;
@@ -24,6 +24,22 @@ function getClient(): OpenAI {
     client = new OpenAI();
   }
   return client;
+}
+
+export function getEmbeddingModel(): string {
+  return process.env.GBRAIN_EMBEDDING_MODEL?.trim() || DEFAULT_MODEL;
+}
+
+export function getEmbeddingDimensions(): number {
+  const raw = process.env.GBRAIN_EMBEDDING_DIMENSIONS?.trim();
+  if (!raw) return DEFAULT_DIMENSIONS;
+
+  const dimensions = Number(raw);
+  if (!Number.isInteger(dimensions) || dimensions <= 0) {
+    throw new Error('GBRAIN_EMBEDDING_DIMENSIONS must be a positive integer');
+  }
+
+  return dimensions;
 }
 
 export async function embed(text: string): Promise<Float32Array> {
@@ -63,9 +79,9 @@ async function embedBatchWithRetry(texts: string[]): Promise<Float32Array[]> {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       const response = await getClient().embeddings.create({
-        model: MODEL,
+        model: getEmbeddingModel(),
         input: texts,
-        dimensions: DIMENSIONS,
+        dimensions: getEmbeddingDimensions(),
       });
 
       // Sort by index to maintain order
@@ -104,7 +120,8 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export { MODEL as EMBEDDING_MODEL, DIMENSIONS as EMBEDDING_DIMENSIONS };
+export const EMBEDDING_MODEL = getEmbeddingModel();
+export const EMBEDDING_DIMENSIONS = getEmbeddingDimensions();
 
 /**
  * v0.20.0 Cathedral II Layer 8 (D1): USD cost per 1k tokens for

@@ -358,6 +358,62 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     }
   }, 15_000);
 
+  test('DCR authorization_code client can exchange code after urlencoded body parsing', async () => {
+    const { createHash } = await import('crypto');
+    const redirectUri = `http://localhost:${PORT}/callback`;
+    const codeVerifier = 'codex-e2e-verifier-abcdefghijklmnopqrstuvwxyz0123456789';
+    const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+
+    const registerRes = await fetch(`${BASE}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'e2e-codex-auth-code',
+        redirect_uris: [redirectUri],
+        grant_types: ['authorization_code', 'refresh_token'],
+        token_endpoint_auth_method: 'none',
+        scope: 'read write',
+      }),
+    });
+    expect(registerRes.ok).toBe(true);
+    const client = await registerRes.json() as any;
+    if (client.client_id) dcrClientIds.push(client.client_id);
+
+    const authorizeUrl = new URL(`${BASE}/authorize`);
+    authorizeUrl.searchParams.set('response_type', 'code');
+    authorizeUrl.searchParams.set('client_id', client.client_id);
+    authorizeUrl.searchParams.set('redirect_uri', redirectUri);
+    authorizeUrl.searchParams.set('scope', 'read write');
+    authorizeUrl.searchParams.set('state', 'codex-e2e-state');
+    authorizeUrl.searchParams.set('code_challenge', codeChallenge);
+    authorizeUrl.searchParams.set('code_challenge_method', 'S256');
+
+    const authorizeRes = await fetch(authorizeUrl, { redirect: 'manual' });
+    expect(authorizeRes.status).toBe(302);
+    const location = authorizeRes.headers.get('location');
+    expect(location).toBeTruthy();
+    const code = new URL(location!).searchParams.get('code');
+    expect(code).toBeTruthy();
+
+    const tokenRes = await fetch(`${BASE}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: client.client_id,
+        code: code!,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+      }),
+    });
+    const tokenBody = await tokenRes.json() as any;
+
+    expect(tokenRes.ok).toBe(true);
+    expect(tokenBody.access_token).toMatch(/^gbrain_at_/);
+    expect(tokenBody.refresh_token).toMatch(/^gbrain_rt_/);
+    expect(tokenBody.scope).toContain('read');
+  }, 15_000);
+
   // =========================================================================
   // v0.26.2: revoke-client CLI subprocess test
   // =========================================================================

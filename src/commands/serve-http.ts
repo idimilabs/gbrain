@@ -43,6 +43,29 @@ interface ServeHttpOptions {
   publicUrl?: string;
 }
 
+function parseTokenClientCredentials(req: Request): { clientId?: string; clientSecret?: string } {
+  const auth = String(req.headers.authorization || '');
+  if (auth.startsWith('Basic ')) {
+    try {
+      const decoded = Buffer.from(auth.slice('Basic '.length), 'base64').toString('utf8');
+      const idx = decoded.indexOf(':');
+      if (idx >= 0) {
+        return {
+          clientId: decodeURIComponent(decoded.slice(0, idx)),
+          clientSecret: decodeURIComponent(decoded.slice(idx + 1)),
+        };
+      }
+    } catch {
+      return {};
+    }
+  }
+
+  return {
+    clientId: req.body?.client_id ? String(req.body.client_id) : undefined,
+    clientSecret: req.body?.client_secret ? String(req.body.client_secret) : undefined,
+  };
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, publicUrl } = options;
   const config = loadConfig() || { engine: 'pglite' as const };
@@ -124,18 +147,85 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   });
 
   app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
-    if (req.body?.grant_type !== 'client_credentials') {
-      return next(); // Fall through to SDK's token handler
-    }
-
     try {
-      const { client_id, client_secret, scope } = req.body;
+      const { grant_type, client_id, client_secret, scope } = req.body;
+      if (grant_type !== 'client_credentials') {
+        return next(); // Fall through to SDK's token handler
+      }
       if (!client_id || !client_secret) {
         res.status(400).json({ error: 'invalid_request', error_description: 'client_id and client_secret required' });
         return;
       }
 
       const tokens = await oauthProvider.exchangeClientCredentials(client_id, client_secret, scope);
+      res.json(tokens);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      res.status(400).json({ error: 'invalid_grant', error_description: msg });
+    }
+  });
+
+  app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
+    const grantType = req.body?.grant_type;
+    if (grantType !== 'authorization_code' && grantType !== 'refresh_token') {
+      return next();
+    }
+
+    try {
+      const credentials = parseTokenClientCredentials(req);
+      if (!credentials.clientId) {
+        res.status(400).json({ error: 'invalid_request', error_description: 'client_id required' });
+        return;
+      }
+
+      const client = await oauthProvider.clientsStore.getClient(credentials.clientId);
+      if (!client) {
+        res.status(400).json({ error: 'invalid_client', error_description: 'Client not found' });
+        return;
+      }
+
+      const authMethod = client.token_endpoint_auth_method || 'client_secret_post';
+      if (authMethod !== 'none') {
+        if (!credentials.clientSecret || createHash('sha256').update(credentials.clientSecret).digest('hex') !== client.client_secret) {
+          res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client secret' });
+          return;
+        }
+      }
+
+      const resource = req.body?.resource ? new URL(String(req.body.resource)) : undefined;
+      if (grantType === 'authorization_code') {
+        const code = String(req.body?.code || '');
+        const codeVerifier = String(req.body?.code_verifier || '');
+        if (!code || !codeVerifier) {
+          res.status(400).json({ error: 'invalid_request', error_description: 'code and code_verifier required' });
+          return;
+        }
+
+        const expectedChallenge = await oauthProvider.challengeForAuthorizationCode(client, code);
+        const actualChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+        if (actualChallenge !== expectedChallenge) {
+          res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid code_verifier' });
+          return;
+        }
+
+        const tokens = await oauthProvider.exchangeAuthorizationCode(
+          client,
+          code,
+          codeVerifier,
+          req.body?.redirect_uri ? String(req.body.redirect_uri) : undefined,
+          resource,
+        );
+        res.json(tokens);
+        return;
+      }
+
+      const refreshToken = String(req.body?.refresh_token || '');
+      if (!refreshToken) {
+        res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token required' });
+        return;
+      }
+      const requestedScopes = req.body?.scope ? String(req.body.scope).split(' ').filter(Boolean) : undefined;
+      const tokens = await oauthProvider.exchangeRefreshToken(client, refreshToken, requestedScopes, resource);
       res.json(tokens);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
